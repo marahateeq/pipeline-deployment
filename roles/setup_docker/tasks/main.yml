@@ -1,0 +1,180 @@
+---
+# Ansible Role: setup_docker
+# Description: Installs and configures Docker and Docker Compose on target hosts
+# Supports: Ubuntu/Debian, RHEL/CentOS, Amazon Linux
+
+- name: Detect OS family
+  set_fact:
+    os_family: "{{ ansible_os_family | lower }}"
+
+- name: Display OS information
+  debug:
+    msg: "Detected OS: {{ ansible_distribution }} {{ ansible_distribution_version }} ({{ os_family }})"
+
+# ============================================================
+# Docker Installation - Debian/Ubuntu
+# ============================================================
+- name: Install Docker prerequisites (Debian/Ubuntu)
+  apt:
+    name:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg
+      - lsb-release
+      - software-properties-common
+    state: present
+    update_cache: yes
+  when: os_family == "debian"
+
+- name: Add Docker GPG key (Debian/Ubuntu)
+  apt_key:
+    url: https://download.docker.com/linux/ubuntu/gpg
+    state: present
+  when: os_family == "debian"
+
+- name: Add Docker repository (Debian/Ubuntu)
+  apt_repository:
+    repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+    state: present
+  when: os_family == "debian"
+
+- name: Install Docker (Debian/Ubuntu)
+  apt:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+    update_cache: yes
+  when: os_family == "debian"
+
+# ============================================================
+# Docker Installation - RHEL/CentOS
+# ============================================================
+- name: Install Docker prerequisites (RHEL/CentOS)
+  yum:
+    name:
+      - yum-utils
+      - device-mapper-persistent-data
+      - lvm2
+    state: present
+  when: os_family == "redhat"
+
+- name: Add Docker repository (RHEL/CentOS)
+  command: yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+  args:
+    creates: /etc/yum.repos.d/docker-ce.repo
+  when: os_family == "redhat"
+
+- name: Install Docker (RHEL/CentOS)
+  yum:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+    state: present
+  when: os_family == "redhat"
+
+# ============================================================
+# Common Docker Configuration
+# ============================================================
+- name: Ensure Docker service is started and enabled
+  systemd:
+    name: docker
+    state: started
+    enabled: yes
+    daemon_reload: yes
+
+- name: Add ansible user to docker group
+  user:
+    name: "{{ ansible_user }}"
+    groups: docker
+    append: yes
+  ignore_errors: yes
+
+- name: Create Docker daemon configuration directory
+  file:
+    path: /etc/docker
+    state: directory
+    mode: "0755"
+
+- name: Configure Docker daemon
+  copy:
+    content: |
+      {
+        "log-driver": "json-file",
+        "log-opts": {
+          "max-size": "10m",
+          "max-file": "3"
+        },
+        "storage-driver": "overlay2",
+        "live-restore": true
+      }
+    dest: /etc/docker/daemon.json
+    mode: "0644"
+  notify: restart docker
+
+- name: Restart Docker if configuration changed
+  meta: flush_handlers
+
+# ============================================================
+# Docker Compose Installation
+# ============================================================
+- name: Check if Docker Compose is already installed
+  command: docker compose version
+  register: compose_check
+  ignore_errors: yes
+  changed_when: false
+
+- name: Display Docker Compose status
+  debug:
+    msg: "Docker Compose is {{ 'already installed' if compose_check.rc == 0 else 'not installed, will install' }}"
+
+- name: Install Docker Compose plugin (newer method)
+  shell: |
+    DOCKER_CONFIG=${DOCKER_CONFIG:-/usr/local/lib/docker}
+    mkdir -p $DOCKER_CONFIG/cli-plugins
+    curl -SL https://github.com/docker/compose/releases/download/v2.20.0/docker-compose-linux-x86_64 -o $DOCKER_CONFIG/cli-plugins/docker-compose
+    chmod +x $DOCKER_CONFIG/cli-plugins/docker-compose
+  args:
+    creates: /usr/local/lib/docker/cli-plugins/docker-compose
+  when: compose_check.rc != 0
+
+- name: Create symbolic link for docker-compose
+  file:
+    src: /usr/local/lib/docker/cli-plugins/docker-compose
+    dest: /usr/local/bin/docker-compose
+    state: link
+  ignore_errors: yes
+
+# ============================================================
+# Verification
+# ============================================================
+- name: Verify Docker installation
+  command: docker --version
+  register: docker_version
+  changed_when: false
+
+- name: Verify Docker Compose installation
+  command: docker compose version
+  register: compose_version
+  changed_when: false
+
+- name: Display installation summary
+  debug:
+    msg: |
+      ========================================
+      Docker Setup Complete
+      ========================================
+      Docker: {{ docker_version.stdout }}
+      Docker Compose: {{ compose_version.stdout }}
+      ========================================
+
+# ============================================================
+# Handlers
+# ============================================================
+- name: restart docker
+  systemd:
+    name: docker
+    state: restarted

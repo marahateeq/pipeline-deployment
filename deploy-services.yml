@@ -1,0 +1,191 @@
+---
+# Ansible Playbook for Deploying Docker-based Services
+# Author: System Design Team
+# Description: This playbook deploys containerized services using Docker Compose
+# Usage: ansible-playbook deploy-services.yml -i ../deployment-config/inventory.ini -e "env=dev service_name=user-api"
+
+- name: Deploy Docker Services
+  hosts: "{{ env | default('dev') }}"
+  become: yes
+
+  vars:
+    docker_compose_version: "2.20.0"
+    services_base_path: "/opt/services"
+    deployment_config_path: "../deployment-config"
+
+  roles:
+    - setup_docker
+
+  tasks:
+    # ============================================================
+    # PHASE 1: Validate inputs and check prerequisites
+    # ============================================================
+    - name: Validate required variables
+      assert:
+        that:
+          - service_name is defined
+          - env is defined
+        fail_msg: "Required variables missing: service_name and env must be defined"
+
+    - name: Display deployment information
+      debug:
+        msg: |
+          ========================================
+          Deploying Service
+          ========================================
+          Service: {{ service_name }}
+          Environment: {{ env }}
+          Target Host: {{ inventory_hostname }}
+          ========================================
+
+    # ============================================================
+    # PHASE 2: Prepare service directory
+    # ============================================================
+    - name: Ensure services base directory exists
+      file:
+        path: "{{ services_base_path }}"
+        state: directory
+        mode: "0755"
+        owner: root
+        group: root
+
+    - name: Create service-specific directory
+      file:
+        path: "{{ services_base_path }}/{{ service_name }}"
+        state: directory
+        mode: "0755"
+
+    # ============================================================
+    # PHASE 3: Transfer and process docker-compose configuration
+    # ============================================================
+    - name: Check if service config exists
+      stat:
+        path: "{{ deployment_config_path }}/services/{{ service_name }}/docker-compose.yaml.j2"
+      delegate_to: localhost
+      register: service_config_stat
+
+    - name: Fail if service config not found
+      fail:
+        msg: "Service configuration not found: {{ deployment_config_path }}/services/{{ service_name }}/docker-compose.yaml.j2"
+      when: not service_config_stat.stat.exists
+
+    - name: Load environment-specific variables
+      include_vars:
+        file: "{{ deployment_config_path }}/vars/{{ env }}-vars.yml"
+      ignore_errors: yes
+
+    - name: Load common variables
+      include_vars:
+        file: "{{ deployment_config_path }}/vars/common-vars.yml"
+      ignore_errors: yes
+
+    - name: Template docker-compose file
+      template:
+        src: "{{ deployment_config_path }}/services/{{ service_name }}/docker-compose.yaml.j2"
+        dest: "{{ services_base_path }}/{{ service_name }}/docker-compose.yml"
+        mode: "0644"
+
+    - name: Copy global docker-compose settings if exists
+      copy:
+        src: "{{ deployment_config_path }}/docker-compose.global.yaml"
+        dest: "{{ services_base_path }}/{{ service_name }}/docker-compose.global.yml"
+        mode: "0644"
+      when: deployment_config_path + '/docker-compose.global.yaml' is file
+      ignore_errors: yes
+
+    # ============================================================
+    # PHASE 4: Stop existing service
+    # ============================================================
+    - name: Check if service is already running
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml ps -q"
+      register: running_containers
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Stop existing service containers
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml down"
+      args:
+        chdir: "{{ services_base_path }}/{{ service_name }}"
+      when: running_containers.stdout != ""
+      ignore_errors: yes
+
+    # ============================================================
+    # PHASE 5: Pull latest images
+    # ============================================================
+    - name: Pull latest Docker images
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml pull"
+      args:
+        chdir: "{{ services_base_path }}/{{ service_name }}"
+      register: pull_result
+      ignore_errors: yes
+
+    - name: Display pull result
+      debug:
+        var: pull_result.stdout_lines
+      when: pull_result.stdout_lines is defined
+
+    # ============================================================
+    # PHASE 6: Start service
+    # ============================================================
+    - name: Start service with Docker Compose
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml up -d"
+      args:
+        chdir: "{{ services_base_path }}/{{ service_name }}"
+      register: compose_up_result
+
+    - name: Display service startup output
+      debug:
+        var: compose_up_result.stdout_lines
+
+    # ============================================================
+    # PHASE 7: Verify deployment
+    # ============================================================
+    - name: Wait for service to be healthy
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml ps"
+      args:
+        chdir: "{{ services_base_path }}/{{ service_name }}"
+      register: service_status
+      until: service_status.stdout.find("Up") != -1
+      retries: 10
+      delay: 5
+      ignore_errors: yes
+
+    - name: Display service status
+      debug:
+        msg: |
+          ========================================
+          Service Status
+          ========================================
+          {{ service_status.stdout }}
+          ========================================
+
+    - name: Get container logs (last 20 lines)
+      shell: "docker compose -f {{ services_base_path }}/{{ service_name }}/docker-compose.yml logs --tail=20"
+      args:
+        chdir: "{{ services_base_path }}/{{ service_name }}"
+      register: container_logs
+      ignore_errors: yes
+
+    - name: Display container logs
+      debug:
+        var: container_logs.stdout_lines
+      when: container_logs.stdout_lines is defined
+
+    # ============================================================
+    # PHASE 8: Clean up old images
+    # ============================================================
+    - name: Remove dangling Docker images
+      shell: "docker image prune -f"
+      ignore_errors: yes
+
+    - name: Final deployment summary
+      debug:
+        msg: |
+          ========================================
+          Deployment Complete!
+          ========================================
+          Service: {{ service_name }}
+          Environment: {{ env }}
+          Location: {{ services_base_path }}/{{ service_name }}
+          Status: {{ 'SUCCESS' if service_status.rc == 0 else 'CHECK REQUIRED' }}
+          ========================================

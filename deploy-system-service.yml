@@ -1,0 +1,214 @@
+---
+# Ansible Playbook for Deploying System Services (systemd)
+# Author: System Design Team
+# Description: This playbook deploys and manages systemd services
+# Usage: ansible-playbook deploy-system-service.yml -i ../deployment-config/inventory.ini -e "env=dev service_name=data-processor"
+
+- name: Deploy System Service
+  hosts: "{{ env | default('dev') }}"
+  become: yes
+
+  vars:
+    services_base_path: "/opt/services"
+    deployment_config_path: "../deployment-config"
+    systemd_path: "/etc/systemd/system"
+
+  tasks:
+    # ============================================================
+    # PHASE 1: Validate inputs
+    # ============================================================
+    - name: Validate required variables
+      assert:
+        that:
+          - service_name is defined
+          - env is defined
+        fail_msg: "Required variables missing: service_name and env must be defined"
+
+    - name: Display deployment information
+      debug:
+        msg: |
+          ========================================
+          Deploying System Service
+          ========================================
+          Service: {{ service_name }}
+          Environment: {{ env }}
+          Target Host: {{ inventory_hostname }}
+          ========================================
+
+    # ============================================================
+    # PHASE 2: Check if service config exists
+    # ============================================================
+    - name: Check if service configuration exists
+      stat:
+        path: "{{ deployment_config_path }}/system-services/{{ service_name }}"
+      delegate_to: localhost
+      register: service_config_dir
+
+    - name: Fail if service config not found
+      fail:
+        msg: "Service configuration directory not found: {{ deployment_config_path }}/system-services/{{ service_name }}"
+      when: not service_config_dir.stat.exists
+
+    - name: Check if systemd service file exists
+      stat:
+        path: "{{ deployment_config_path }}/system-services/{{ service_name }}/{{ service_name }}.service.j2"
+      delegate_to: localhost
+      register: systemd_service_file
+
+    - name: Fail if systemd service file not found
+      fail:
+        msg: "Systemd service file not found: {{ service_name }}.service.j2"
+      when: not systemd_service_file.stat.exists
+
+    # ============================================================
+    # PHASE 3: Stop existing service if running
+    # ============================================================
+    - name: Check if service is already installed
+      stat:
+        path: "{{ systemd_path }}/{{ service_name }}.service"
+      register: existing_service
+
+    - name: Stop existing service
+      systemd:
+        name: "{{ service_name }}"
+        state: stopped
+      when: existing_service.stat.exists
+      ignore_errors: yes
+
+    - name: Disable existing service
+      systemd:
+        name: "{{ service_name }}"
+        enabled: no
+      when: existing_service.stat.exists
+      ignore_errors: yes
+
+    # ============================================================
+    # PHASE 4: Prepare service directory and files
+    # ============================================================
+    - name: Ensure services base directory exists
+      file:
+        path: "{{ services_base_path }}"
+        state: directory
+        mode: "0755"
+
+    - name: Create service installation directory
+      file:
+        path: "{{ services_base_path }}/{{ service_name }}"
+        state: directory
+        mode: "0755"
+
+    - name: Load environment-specific variables
+      include_vars:
+        file: "{{ deployment_config_path }}/vars/{{ env }}-vars.yml"
+      ignore_errors: yes
+
+    - name: Load common variables
+      include_vars:
+        file: "{{ deployment_config_path }}/vars/common-vars.yml"
+      ignore_errors: yes
+
+    # ============================================================
+    # PHASE 5: Copy service files
+    # ============================================================
+    - name: Find all service files
+      find:
+        paths: "{{ deployment_config_path }}/system-services/{{ service_name }}"
+        patterns: "*"
+        file_type: file
+      delegate_to: localhost
+      register: service_files
+
+    - name: Copy service files to target
+      copy:
+        src: "{{ item.path }}"
+        dest: "{{ services_base_path }}/{{ service_name }}/{{ item.path | basename | regex_replace('\\.j2$', '') }}"
+        mode: "0644"
+      loop: "{{ service_files.files }}"
+      when: not item.path.endswith('.j2')
+
+    - name: Template service configuration files
+      template:
+        src: "{{ item.path }}"
+        dest: "{{ services_base_path }}/{{ service_name }}/{{ item.path | basename | regex_replace('\\.j2$', '') }}"
+        mode: "0644"
+      loop: "{{ service_files.files }}"
+      when: item.path.endswith('.j2') and not item.path.endswith('.service.j2')
+
+    # ============================================================
+    # PHASE 6: Install systemd service
+    # ============================================================
+    - name: Template systemd service file
+      template:
+        src: "{{ deployment_config_path }}/system-services/{{ service_name }}/{{ service_name }}.service.j2"
+        dest: "{{ systemd_path }}/{{ service_name }}.service"
+        mode: "0644"
+
+    - name: Reload systemd daemon
+      systemd:
+        daemon_reload: yes
+
+    # ============================================================
+    # PHASE 7: Start and enable service
+    # ============================================================
+    - name: Enable service to start on boot
+      systemd:
+        name: "{{ service_name }}"
+        enabled: yes
+
+    - name: Start service
+      systemd:
+        name: "{{ service_name }}"
+        state: started
+      register: service_start_result
+
+    - name: Wait for service to stabilize
+      pause:
+        seconds: 5
+
+    # ============================================================
+    # PHASE 8: Verify service status
+    # ============================================================
+    - name: Check service status
+      systemd:
+        name: "{{ service_name }}"
+      register: service_status
+
+    - name: Display service status
+      debug:
+        msg: |
+          ========================================
+          Service Status
+          ========================================
+          Service: {{ service_name }}
+          Active: {{ service_status.status.ActiveState }}
+          Sub-state: {{ service_status.status.SubState }}
+          Main PID: {{ service_status.status.MainPID }}
+          ========================================
+
+    - name: Get service logs (last 20 lines)
+      shell: "journalctl -u {{ service_name }} -n 20 --no-pager"
+      register: service_logs
+      ignore_errors: yes
+
+    - name: Display service logs
+      debug:
+        var: service_logs.stdout_lines
+      when: service_logs.stdout_lines is defined
+
+    - name: Fail if service is not running
+      fail:
+        msg: "Service {{ service_name }} failed to start. Check logs above."
+      when: service_status.status.ActiveState != "active"
+
+    - name: Final deployment summary
+      debug:
+        msg: |
+          ========================================
+          Deployment Complete!
+          ========================================
+          Service: {{ service_name }}
+          Environment: {{ env }}
+          Location: {{ services_base_path }}/{{ service_name }}
+          Systemd Unit: {{ systemd_path }}/{{ service_name }}.service
+          Status: RUNNING
+          ========================================
